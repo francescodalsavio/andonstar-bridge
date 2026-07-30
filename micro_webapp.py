@@ -7,9 +7,14 @@ Protocollo (reverse-eng. da therealdreg/AndonstarOSWV):
   3) par=0 -> spegne preview
 Riserve lo stream come MJPEG a http://localhost:8088 (funziona OFFLINE, tutto locale).
 
+In piu': galleria delle FOTO/VIDEO registrati sull'SD del microscopio
+(/DCIM/PHOTO a 4032x3024 = 12 MP, /DCIM/MOVIE) scaricabili a piena risoluzione
+via il ponte. Il preview WiFi live e' fisso a 640x368 (deciso dal microscopio),
+quindi per il full-res si scatta col pulsante fisico e si scarica da qui.
+
 Uso:
   1) Attiva Wi-Fi sul microscopio (menu Impostazioni)
-  2) Connetti il Wi-Fi del Mac all'AP "Andonstar-..." (pass 12345678)
+  2) Connetti il Wi-Fi all'AP "Andonstar-..." (pass 12345678)
   3) python3 micro_webapp.py           (opz: python3 micro_webapp.py 192.168.1.254)
   4) Apri http://localhost:8088
 """
@@ -105,13 +110,89 @@ def grabber():
             time.sleep(2)
 
 
+# --- Galleria file registrati sull'SD (DCIM/PHOTO, DCIM/MOVIE) ---------------
+
+def list_dir(cam_path):
+    """Elenca i file (JPG/MP4) di una cartella DCIM leggendo il file-browser del microscopio."""
+    try:
+        s = _sock(CAM, 80, 6)
+    except Exception:
+        return []
+    s.sendall((f"GET {cam_path} HTTP/1.1\r\nHost: {CAM}\r\n"
+               f"User-Agent: curl/8\r\nConnection: close\r\n\r\n").encode())
+    data = b""
+    try:
+        while True:
+            c = s.recv(4096)
+            if not c:
+                break
+            data += c
+    except Exception:
+        pass
+    s.close()
+    body = data.split(b"\r\n\r\n", 1)[-1]
+    out = []
+    for h in re.findall(rb'href="(/DCIM/[^"?]+\.(?:JPG|MP4))"', body, re.I):
+        h = h.decode()
+        if h not in out:
+            out.append(h)
+    out.sort(reverse=True)  # piu' recenti in cima (nome = timestamp)
+    return out
+
+
+def proxy_file(handler, cam_path):
+    """Rilancia un file dell'SD (foto/video) dal microscopio al browser, a piena risoluzione."""
+    if not cam_path.startswith("/DCIM/"):
+        handler.send_response(400); handler.end_headers(); return
+    try:
+        s = _sock(CAM, 80, 12)
+    except Exception:
+        handler.send_response(502); handler.end_headers(); return
+    s.sendall((f"GET {cam_path} HTTP/1.1\r\nHost: {CAM}\r\n"
+               f"User-Agent: curl/8\r\nConnection: close\r\n\r\n").encode())
+    buf = b""
+    try:
+        while b"\r\n\r\n" not in buf:
+            c = s.recv(4096)
+            if not c:
+                break
+            buf += c
+    except Exception:
+        handler.send_response(504); handler.end_headers(); s.close(); return
+    head, body = buf.split(b"\r\n\r\n", 1)
+    parts = head.split(b"\r\n", 1)[0].split()
+    code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 200
+    m = re.search(rb"Content-Length:\s*(\d+)", head, re.I)
+    clen = int(m.group(1)) if m else None
+    up = cam_path.upper()
+    ctype = 'image/jpeg' if up.endswith('.JPG') else ('video/mp4' if up.endswith('.MP4') else 'application/octet-stream')
+    handler.send_response(code)
+    handler.send_header('Content-Type', ctype)
+    if clen is not None:
+        handler.send_header('Content-Length', str(clen))
+    handler.end_headers()
+    try:
+        handler.wfile.write(body)
+        got = len(body)
+        while clen is None or got < clen:
+            c = s.recv(65536)
+            if not c:
+                break
+            handler.wfile.write(c)
+            got += len(c)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        s.close()
+
+
 PAGE = """<!doctype html><html lang=it><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Visla Microscopio</title><style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#0b0f14;--pan:#131a22;--ln:#243140;--tx:#e6edf3;--mut:#8aa0b4;--ok:#3fb950;--no:#f85149;--ac:#2f81f7}
 body{background:var(--bg);color:var(--tx);font:14px/1.4 -apple-system,SF Pro Text,Segoe UI,sans-serif;height:100vh;display:flex;flex-direction:column}
-header{display:flex;align-items:center;gap:14px;padding:10px 16px;background:var(--pan);border-bottom:1px solid var(--ln)}
+header{display:flex;align-items:center;gap:14px;padding:10px 16px;background:var(--pan);border-bottom:1px solid var(--ln);flex-wrap:wrap}
 h1{font-size:15px;font-weight:650}
 .dot{width:9px;height:9px;border-radius:50%;background:var(--no);box-shadow:0 0 8px var(--no);transition:.3s}
 .dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
@@ -122,28 +203,88 @@ button:hover{border-color:var(--ac);color:#fff}
 main{flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:12px}
 #v{max-width:100%;max-height:100%;border-radius:10px;border:1px solid var(--ln);background:#000;object-fit:contain}
 #wait{color:var(--mut);text-align:center;line-height:1.7}#wait b{color:var(--tx)}
+/* galleria */
+#gal{position:fixed;inset:0;background:rgba(6,9,13,.97);z-index:10;display:none;flex-direction:column}
+#gal header{background:var(--pan)}
+.grid{flex:1;overflow:auto;padding:14px;display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;align-content:start}
+.card{background:var(--pan);border:1px solid var(--ln);border-radius:10px;overflow:hidden;display:flex;flex-direction:column}
+.card img{width:100%;aspect-ratio:4/3;object-fit:cover;background:#000;cursor:zoom-in}
+.card .cap{padding:6px 8px;font-size:11px;color:var(--mut);display:flex;gap:8px;align-items:center;justify-content:space-between}
+.card a.dl{color:var(--ac);text-decoration:none;font-weight:600}
+.vid{grid-column:1/-1;display:flex;gap:10px;flex-wrap:wrap;align-items:center;border-top:1px solid var(--ln);padding-top:10px;margin-top:4px}
+.vid a{color:var(--ac);text-decoration:none;border:1px solid var(--ln);border-radius:8px;padding:6px 10px}
+#lb{position:fixed;inset:0;background:rgba(0,0,0,.95);z-index:20;display:none;align-items:center;justify-content:center;flex-direction:column;gap:10px}
+#lb img{max-width:96vw;max-height:88vh;object-fit:contain}
+#lb .bar{color:var(--mut);font-size:12px}
+.hint{color:var(--mut);font-size:12px;padding:0 4px}
 </style></head><body>
 <header>
 <span class=dot id=dot></span><h1>🔬 Visla Microscopio</h1>
 <span class=meta id=st>in attesa…</span><span class=sp></span>
-<button onclick=snap()>📸 Salva foto</button>
+<button onclick=snap()>📸 Salva frame</button>
+<button onclick=openGal()>📁 Registrate</button>
 <button onclick=fs()>⛶ Schermo intero</button>
 </header>
 <main>
 <img id=v alt="" style="display:none">
-<div id=wait><b>Nessun segnale.</b><br>Connetti il Wi-Fi del Mac all'AP del microscopio.<br>Riprovo in automatico…</div>
+<div id=wait><b>Nessun segnale.</b><br>Connetti il Wi-Fi all'AP del microscopio.<br>Riprovo in automatico…</div>
 </main>
+
+<div id=gal>
+  <header>
+    <h1>📁 Foto &amp; video registrati <span class=meta id=galn></span></h1>
+    <span class=hint>Full-res 12 MP dall'SD · scatta col pulsante fisico del microscopio</span>
+    <span class=sp></span>
+    <button onclick=loadGal()>↻ Aggiorna</button>
+    <button onclick=closeGal()>✕ Chiudi</button>
+  </header>
+  <div class=grid id=grid></div>
+</div>
+
+<div id=lb onclick="this.style.display='none'">
+  <img id=lbimg alt=""><div class=bar id=lbbar></div>
+</div>
+
 <script>
 const v=document.getElementById('v'),dot=document.getElementById('dot'),st=document.getElementById('st'),wait=document.getElementById('wait');
 function start(){v.src='/stream?'+Date.now();}
 v.onerror=()=>setTimeout(start,1500);
 async function poll(){try{const r=await fetch('/info',{cache:'no-store'});const j=await r.json();
   const live=j.age<3;dot.classList.toggle('on',live);
-  st.textContent=live?`● live · ${j.fps} fps · ${j.count} frame`:'segnale perso, riprovo…';
+  st.textContent=live?`● live · ${j.fps} fps · 640×368`:'segnale perso, riprovo…';
   v.style.display=live?'':'none';wait.style.display=live?'none':'';
 }catch(e){dot.classList.remove('on');}}
 function snap(){const a=document.createElement('a');a.href='/snap?'+Date.now();a.download='micro-'+Date.now()+'.jpg';a.click();}
 function fs(){document.fullscreenElement?document.exitFullscreen():v.requestFullscreen&&v.requestFullscreen();}
+
+const gal=document.getElementById('gal'),grid=document.getElementById('grid'),galn=document.getElementById('galn');
+const lb=document.getElementById('lb'),lbimg=document.getElementById('lbimg'),lbbar=document.getElementById('lbbar');
+function base(p){return p.split('/').pop();}
+function openLb(p){lbimg.src='/dl?f='+encodeURIComponent(p);lbbar.textContent=base(p)+' · full-res';lb.style.display='flex';}
+function openGal(){gal.style.display='flex';loadGal();}
+function closeGal(){gal.style.display='none';}
+async function loadGal(){
+  grid.innerHTML='<div class=hint>Carico l\\'elenco dall\\'SD…</div>';galn.textContent='';
+  try{
+    const r=await fetch('/photos',{cache:'no-store'});const j=await r.json();
+    grid.innerHTML='';
+    galn.textContent=`· ${j.photos.length} foto · ${j.videos.length} video`;
+    if(!j.photos.length&&!j.videos.length){grid.innerHTML='<div class=hint>Nessun file sull\\'SD. Scatta col pulsante del microscopio.</div>';return;}
+    for(const p of j.photos){
+      const c=document.createElement('div');c.className='card';
+      c.innerHTML=`<img loading=lazy src="/dl?f=${encodeURIComponent(p)}">`+
+        `<div class=cap><span>${base(p)}</span><a class=dl href="/dl?f=${encodeURIComponent(p)}" download>⬇︎</a></div>`;
+      c.querySelector('img').onclick=()=>openLb(p);
+      grid.appendChild(c);
+    }
+    if(j.videos.length){
+      const box=document.createElement('div');box.className='vid';
+      box.innerHTML='<b>🎬 Video:</b>'+j.videos.map(p=>`<a href="/dl?f=${encodeURIComponent(p)}" download>${base(p)}</a>`).join('');
+      grid.appendChild(box);
+    }
+  }catch(e){grid.innerHTML='<div class=hint>Errore nel leggere l\\'SD: '+e+'</div>';}
+}
+
 start();setInterval(poll,1000);poll();
 </script></body></html>"""
 
@@ -172,6 +313,18 @@ class H(BaseHTTPRequestHandler):
                 self.send_response(503); self.end_headers(); return
             self.send_response(200); self.send_header('Content-Type', 'image/jpeg')
             self.send_header('Content-Length', str(len(j))); self.end_headers(); self.wfile.write(j)
+        elif p == '/photos':
+            photos = list_dir("/DCIM/PHOTO")
+            videos = list_dir("/DCIM/MOVIE")
+            import json as _j
+            b = _j.dumps({"photos": photos, "videos": videos}).encode()
+            self.send_response(200); self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
+        elif p == '/dl':
+            from urllib.parse import parse_qs, urlparse, unquote
+            q = parse_qs(urlparse(self.path).query)
+            f = unquote(q.get('f', [''])[0])
+            proxy_file(self, f)
         elif p == '/stream':
             self.send_response(200)
             self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=f')
@@ -196,8 +349,9 @@ class H(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     atexit.register(lambda: preview(False))
     threading.Thread(target=grabber, daemon=True).start()
-    print(f"► Camera {CAM} · apri http://localhost:{HTTP_PORT}  (Ctrl-C per uscire)", flush=True)
+    bind = os.environ.get("MICRO_BIND", "0.0.0.0")
+    print(f"► Camera {CAM} · apri http://{bind}:{HTTP_PORT}  (Ctrl-C per uscire)", flush=True)
     try:
-        ThreadingHTTPServer(('0.0.0.0', HTTP_PORT), H).serve_forever()
+        ThreadingHTTPServer((bind, HTTP_PORT), H).serve_forever()
     except KeyboardInterrupt:
         pass

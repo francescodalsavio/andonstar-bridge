@@ -29,7 +29,7 @@ cd ~/Documents/andonstar-bridge
 
 - **http://192.168.68.77:8088**  (o `http://pi-orvieto:8088`)
 
-Viewer con vista live, pulsante 📸 salva-foto e schermo intero.
+Viewer con vista live, 📸 salva-frame, ⛶ schermo intero e **📁 Registrate**.
 
 Per **fermare**: `Ctrl-C`.
 Per **rimettere wlan0 su casa**: `nmcli device wifi connect "Positive Waves" ifname wlan0` (o riavvia il Pi).
@@ -61,6 +61,19 @@ Reverse-engineering da [therealdreg/AndonstarOSWV](https://github.com/therealdre
 3. `…&par=0` → **spegne** il preview
 
 La porta 8192 si apre **solo dopo** il comando `cmd=3001` (per questo non la vedi con un port-scan normale).
+
+## Risoluzione: live vs registrato
+
+| Sorgente | Risoluzione | Note |
+|---|---|---|
+| **Stream live WiFi** | **640×368** | **Fisso dal firmware** — il microscopio decide, nessuna opzione nel menu WiFi |
+| **Foto registrata (SD)** | **4032×3024 (12 MP)** | Full-res, scaricabile via il ponte |
+| USB diretto | 1920×1080 | non passa dal ponte |
+
+Il preview WiFi **non si può alzare** oltre 640×368. Per il full-res: **scatta col pulsante fisico**
+del microscopio (salva su SD a 12 MP), poi apri **📁 Registrate** nel viewer → galleria di
+`/DCIM/PHOTO` e `/DCIM/MOVIE`, con anteprima, zoom e download a piena risoluzione (il Pi fa da proxy,
+sempre legato a `wlan0` per bypassare Tailscale).
 
 ## File
 
